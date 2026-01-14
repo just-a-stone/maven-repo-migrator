@@ -1,0 +1,14 @@
+[0;32m========================================[0m
+[0;32mMaven仓库推送脚本[0m
+[0;32m========================================[0m
+扫描目录:         ./test-repo
+Release仓库URL:   http://nexus.example.com/repository/releases
+Release仓库ID:    release-repo
+Snapshot仓库URL:  http://nexus.example.com/repository/snapshots
+Snapshot仓库ID:   snapshot-repo
+运行模式:         test
+[0;32m========================================[0m
+
+[0;32m开始扫描目录...[0m
+
+[1;33m[TEST][SNAPSHOT][0m mvn deploy:deploy-file -DgroupId=com.example -DartifactId=myapp -Dversion=1.0.1-SNAPSHOT -Dpackaging=pom -Dfile=./test-repo/com/example/myapp/1.0.1-SNAPSHOT/myapp-1.0.1-SNAPSHOT.pom -Durl=http://nexus.example.com/repository/snapshots -DrepositoryId=snapshot-repo
