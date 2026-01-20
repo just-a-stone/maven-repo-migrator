@@ -25,6 +25,7 @@ usage() {
     --snapshot-id <ID>              Snapshot仓库ID（必需）
     -s, --settings <文件>           指定Maven settings.xml文件路径（可选）
     -m, --mode <模式>               运行模式: test 或 prod（默认: test）
+    -j, --jobs <数量>               并发上传数量（默认: 4）
     -h, --help                      显示此帮助信息
 
 示例:
@@ -57,6 +58,7 @@ SNAPSHOT_REPO_URL=""
 SNAPSHOT_REPO_ID=""
 SETTINGS_FILE=""
 MODE="test"
+PARALLEL_JOBS=4  # 默认并发数
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -87,6 +89,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -m|--mode)
             MODE="$2"
+            shift 2
+            ;;
+        -j|--jobs)
+            PARALLEL_JOBS="$2"
             shift 2
             ;;
         -h|--help)
@@ -153,11 +159,16 @@ echo "Release仓库ID:    $RELEASE_REPO_ID"
 echo "Snapshot仓库URL:  $SNAPSHOT_REPO_URL"
 echo "Snapshot仓库ID:   $SNAPSHOT_REPO_ID"
 echo "运行模式:         $MODE"
+echo "并发数:           $PARALLEL_JOBS"
 if [[ -n "$SETTINGS_FILE" ]]; then
     echo "Settings:         $SETTINGS_FILE"
 fi
 echo -e "${GREEN}========================================${NC}"
 echo ""
+
+# 创建临时目录存储并发结果
+RESULT_DIR=$(mktemp -d)
+trap "rm -rf $RESULT_DIR" EXIT
 
 # 文件收集数组
 declare -A snapshot_files  # 关联数组：key=groupId:artifactId:version:extension, value=文件路径列表（换行分隔）
@@ -178,9 +189,6 @@ parse_maven_info() {
     local file_path="$1"
     local repo_base="$2"
 
-    # 获取相对路径
-    local relative_path="${file_path#$repo_base/}"
-
     # 提取文件名和版本目录
     local filename=$(basename "$file_path")
     local version_dir=$(dirname "$file_path")
@@ -190,9 +198,8 @@ parse_maven_info() {
     local artifact_dir=$(dirname "$version_dir")
     local artifact_id=$(basename "$artifact_dir")
 
-    # 提取groupId（剩余路径，转换/为.）
+    # 提取groupId（使用完整路径，转换/为.）
     local group_path=$(dirname "$artifact_dir")
-    group_path="${group_path#$repo_base/}"
     local group_id=$(echo "$group_path" | tr '/' '.')
 
     echo "$group_id|$artifact_id|$version"
@@ -387,22 +394,37 @@ process_artifact() {
     local filename=$(basename "$file")
     local extension="${filename##*.}"
 
-    # 推送文件并更新统计
-    if deploy_file "$file" "$extension" "$group_id" "$artifact_id" "$version"; then
-        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-        if is_snapshot_version "$version"; then
-            SNAPSHOT_SUCCESS=$((SNAPSHOT_SUCCESS + 1))
-        else
-            RELEASE_SUCCESS=$((RELEASE_SUCCESS + 1))
-        fi
+    # 确定版本类型
+    local version_type
+    if is_snapshot_version "$version"; then
+        version_type="SNAPSHOT"
     else
-        ERROR_COUNT=$((ERROR_COUNT + 1))
-        if is_snapshot_version "$version"; then
-            SNAPSHOT_ERROR=$((SNAPSHOT_ERROR + 1))
-        else
-            RELEASE_ERROR=$((RELEASE_ERROR + 1))
-        fi
+        version_type="RELEASE"
     fi
+
+    # 推送文件并记录结果到临时文件
+    local result_file="$RESULT_DIR/result_$$_$RANDOM"
+    if deploy_file "$file" "$extension" "$group_id" "$artifact_id" "$version"; then
+        echo "SUCCESS|$version_type" >> "$result_file"
+    else
+        echo "ERROR|$version_type" >> "$result_file"
+    fi
+}
+
+# 并发执行函数
+run_parallel() {
+    local running=0
+    for file in "$@"; do
+        (process_artifact "$file") &
+        running=$((running + 1))
+        # 达到并发上限时等待一个任务完成
+        if [[ $running -ge $PARALLEL_JOBS ]]; then
+            wait -n 2>/dev/null || wait
+            running=$((running - 1))
+        fi
+    done
+    # 等待所有剩余任务完成
+    wait
 }
 
 # 扫描并处理所有构件
@@ -417,18 +439,19 @@ done < <(find "$REPO_DIR" -type f \( -name "*.jar" -o -name "*.pom" -o -name "*.
 echo -e "${GREEN}文件收集完成，开始处理...${NC}"
 echo ""
 
-# 第二阶段：处理 RELEASE 文件
-for file in "${release_files[@]}"; do
-    process_artifact "$file"
-done
+# 第二阶段：处理 RELEASE 文件（并发）
+if [[ ${#release_files[@]} -gt 0 ]]; then
+    run_parallel "${release_files[@]}"
+fi
 
-# 第三阶段：处理 SNAPSHOT 文件（去重后）
+# 第三阶段：处理 SNAPSHOT 文件（去重后，并发）
+declare -a snapshot_to_process
 for group_key in "${!snapshot_files[@]}"; do
     files="${snapshot_files[$group_key]}"
 
-    # 如果该组只有一个文件，直接处理
+    # 如果该组只有一个文件，直接添加
     if [[ "$files" != *$'\n'* ]]; then
-        process_artifact "$files"
+        snapshot_to_process+=("$files")
     else
         # 多个文件：选择最新的
         latest=$(select_latest_snapshot "$files")
@@ -438,12 +461,38 @@ for group_key in "${!snapshot_files[@]}"; do
             echo -e "${YELLOW}[DEDUP]${NC} $group_key: 发现 $file_count 个文件，选择最新: $(basename "$latest")"
         fi
 
-        process_artifact "$latest"
+        snapshot_to_process+=("$latest")
 
         # 更新跳过计数（去重的文件算作跳过）
         SKIP_COUNT=$((SKIP_COUNT + file_count - 1))
     fi
 done
+
+if [[ ${#snapshot_to_process[@]} -gt 0 ]]; then
+    run_parallel "${snapshot_to_process[@]}"
+fi
+
+# 汇总统计结果
+while IFS='|' read -r status type; do
+    case "$status|$type" in
+        SUCCESS|RELEASE)
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            RELEASE_SUCCESS=$((RELEASE_SUCCESS + 1))
+            ;;
+        SUCCESS|SNAPSHOT)
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            SNAPSHOT_SUCCESS=$((SNAPSHOT_SUCCESS + 1))
+            ;;
+        ERROR|RELEASE)
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            RELEASE_ERROR=$((RELEASE_ERROR + 1))
+            ;;
+        ERROR|SNAPSHOT)
+            ERROR_COUNT=$((ERROR_COUNT + 1))
+            SNAPSHOT_ERROR=$((SNAPSHOT_ERROR + 1))
+            ;;
+    esac
+done < <(cat "$RESULT_DIR"/result_* 2>/dev/null)
 
 # 打印统计信息
 echo ""
