@@ -307,6 +307,179 @@ sudo apt-get install maven  # Debian/Ubuntu
 sudo yum install maven      # CentOS/RHEL
 ```
 
+---
+
+# Nexus仓库下载脚本使用说明
+
+## 功能简介
+
+`download_nexus.py` 是一个用于从Nexus私有仓库批量下载Maven构件的Python脚本。它可以下载指定groupId（及其子group）的所有jar和pom文件，并保持Maven标准目录结构。
+
+## 主要特性
+
+- ✅ 支持指定groupId下载，自动包含所有子group
+- ✅ 自动下载jar和pom文件
+- ✅ 保持Maven仓库标准目录结构
+- ✅ 支持分页获取大量构件
+- ✅ 自动跳过已存在的文件（断点续传）
+- ✅ 网络错误自动重试
+- ✅ 404文件自动跳过（不浪费重试次数）
+
+## 环境准备
+
+```bash
+# 创建虚拟环境
+python3 -m venv venv
+
+# 激活虚拟环境
+source venv/bin/activate
+
+# 安装依赖
+pip install requests
+```
+
+## 使用方法
+
+### 基本语法
+
+```bash
+python3 download_nexus.py [选项]
+```
+
+### 参数说明
+
+| 参数 | 长格式 | 说明 | 必需 | 默认值 |
+|------|--------|------|------|--------|
+| `-u` | `--url` | Nexus仓库URL | ✅ | - |
+| | `--user` | Nexus用户名 | ✅ | - |
+| | `--password` | Nexus密码 | ✅ | - |
+| `-g` | `--group` | 要下载的groupId | ✅ | - |
+| `-r` | `--repository` | 仓库名称 | ❌ | maven-releases |
+
+### 使用示例
+
+#### 1. 下载指定groupId的所有构件
+
+```bash
+python3 download_nexus.py \
+  -u https://nexus.example.com \
+  --user repo-reader \
+  --password 'your-password' \
+  -g com.csntcorp.common
+```
+
+#### 2. 下载groupId及其所有子group
+
+```bash
+# 下载 com.iflorens 及 com.iflorens.framework、com.iflorens.common 等所有子group
+python3 download_nexus.py \
+  -u https://nexus.example.com \
+  --user repo-reader \
+  --password 'your-password' \
+  -g com.iflorens
+```
+
+#### 3. 指定仓库名称
+
+```bash
+python3 download_nexus.py \
+  -u https://nexus.example.com \
+  --user repo-reader \
+  --password 'your-password' \
+  -g com.csntcorp \
+  -r maven-releases
+```
+
+### 输出示例
+
+```
+Nexus仓库: https://nexus.example.com
+Repository: maven-releases
+GroupId: com.iflorens
+输出目录: repo/
+
+搜索 jar 文件...
+  继续获取下一页... (已获取 85 个)
+  找到 173 个 jar 文件
+搜索 pom 文件...
+  继续获取下一页... (已获取 50 个)
+  找到 111 个 pom 文件
+
+共找到 284 个文件，开始下载...
+
+[1/284] 下载: /com/iflorens/framework/my-app/1.0.0/my-app-1.0.0.jar
+[2/284] 已存在: /com/iflorens/framework/my-app/1.0.0/my-app-1.0.0.pom
+[3/284] 下载: /com/iflorens/common/utils/2.0.0/utils-2.0.0.jar
+    跳过: 文件不存在 (404)
+...
+
+下载完成: 成功 250, 跳过 30, 失败 4
+```
+
+## 输出目录结构
+
+下载的文件保存在 `repo/` 目录，遵循Maven标准结构：
+
+```
+repo/
+└── com/
+    └── iflorens/
+        ├── framework/
+        │   └── my-app/
+        │       └── 1.0.0/
+        │           ├── my-app-1.0.0.jar
+        │           └── my-app-1.0.0.pom
+        └── common/
+            └── utils/
+                └── 2.0.0/
+                    ├── utils-2.0.0.jar
+                    └── utils-2.0.0.pom
+```
+
+## 与推送脚本配合使用
+
+下载的 `repo/` 目录可以直接作为 `maven-deploy.sh` 的输入目录：
+
+```bash
+# 1. 从源Nexus下载
+python3 download_nexus.py \
+  -u https://source-nexus.example.com \
+  --user repo-reader \
+  --password 'your-password' \
+  -g com.iflorens
+
+# 2. 推送到目标Nexus
+./maven-deploy.sh \
+  -d ./repo/com/iflorens \
+  --release-url http://target-nexus/repository/releases \
+  --release-id target-releases \
+  --snapshot-url http://target-nexus/repository/snapshots \
+  --snapshot-id target-snapshots \
+  -m prod
+```
+
+## 故障排查
+
+### 问题1：搜索API调用失败 - 401 Unauthorized
+
+**原因**：认证失败
+
+**解决**：检查 `--user` 和 `--password` 参数是否正确
+
+### 问题2：大量文件显示404跳过
+
+**原因**：Nexus索引中存在记录但实际文件已被删除
+
+**解决**：这是正常情况，脚本会自动跳过这些文件
+
+### 问题3：下载速度慢
+
+**原因**：网络问题或文件较大
+
+**解决**：脚本支持断点续传，可以中断后重新运行，已下载的文件会自动跳过
+
+---
+
 ## 许可证
 
 MIT License

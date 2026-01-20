@@ -1,0 +1,9 @@
+# 下载的Maven仓库目录
+repo/
+
+# Python虚拟环境
+venv/
+
+# Python缓存
+__pycache__/
+*.pyc
