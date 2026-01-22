@@ -7,7 +7,9 @@ Nexus Maven Repository Jar Download Script
 
 import argparse
 import os
+import re
 import sys
+from collections import defaultdict
 from urllib.parse import urljoin
 import requests
 from requests.auth import HTTPBasicAuth
@@ -116,6 +118,93 @@ def search_assets(nexus_url, group_id, repository, extension, auth):
     return assets
 
 
+def parse_artifact_info(path):
+    """
+    从路径中解析 artifact 信息
+
+    路径格式: groupPath/artifactId/version/filename
+    例如: com/example/mylib/1.0-SNAPSHOT/mylib-1.0-20230101.123456-1.jar
+
+    Returns:
+        (group_path, artifact_id, base_version, filename, timestamp) 或 None
+    """
+    parts = path.strip("/").split("/")
+    if len(parts) < 4:
+        return None
+
+    filename = parts[-1]
+    version = parts[-2]
+    artifact_id = parts[-3]
+    group_path = "/".join(parts[:-3])
+
+    # 提取时间戳（用于 snapshot 版本排序）
+    # 格式: artifactId-version-YYYYMMDD.HHMMSS-buildNum.ext
+    timestamp = None
+    timestamp_match = re.search(r'-(\d{8}\.\d{6})-(\d+)\.', filename)
+    if timestamp_match:
+        timestamp = timestamp_match.group(1) + "-" + timestamp_match.group(2)
+
+    # 获取基础版本（去掉时间戳部分）
+    # 例如: 1.0-SNAPSHOT 或 1.0-20230101.123456-1 -> 1.0-SNAPSHOT
+    base_version = version
+    if "-SNAPSHOT" not in version:
+        # 检查是否是带时间戳的 snapshot 版本
+        version_match = re.match(r'^(.+)-\d{8}\.\d{6}-\d+$', version)
+        if version_match:
+            base_version = version_match.group(1) + "-SNAPSHOT"
+
+    return (group_path, artifact_id, base_version, filename, timestamp)
+
+
+def get_artifact_key(path, filename):
+    """
+    获取 artifact 的唯一标识（不包含时间戳）
+    用于对同一个 artifact 的多个 snapshot 版本进行分组
+    """
+    # 移除时间戳部分，保留基础文件名
+    # 例如: mylib-1.0-20230101.123456-1.jar -> mylib-1.0-SNAPSHOT.jar
+    base_filename = re.sub(r'-\d{8}\.\d{6}-\d+', '-SNAPSHOT', filename)
+    return f"{path}:{base_filename}"
+
+
+def filter_latest_snapshots(assets):
+    """
+    过滤 snapshot 版本，只保留最新的
+
+    对于同一个 artifact 的多个 snapshot 版本，只保留时间戳最新的那个
+    """
+    # 按 artifact key 分组
+    grouped = defaultdict(list)
+    non_snapshot = []
+
+    for asset in assets:
+        path = asset.get("path", "").strip("/")
+        if not path:
+            continue
+
+        # 检查是否是 snapshot 版本（包含 SNAPSHOT 或时间戳格式）
+        if "-SNAPSHOT" in path or re.search(r'-\d{8}\.\d{6}-\d+\.', path):
+            info = parse_artifact_info(path)
+            if info:
+                group_path, artifact_id, base_version, filename, timestamp = info
+                key = get_artifact_key(f"{group_path}/{artifact_id}/{base_version}", filename)
+                grouped[key].append((asset, timestamp or ""))
+            else:
+                # 无法解析的当作普通文件处理
+                non_snapshot.append(asset)
+        else:
+            non_snapshot.append(asset)
+
+    # 对每个分组，选择时间戳最大的（最新的）
+    latest_snapshots = []
+    for key, items in grouped.items():
+        # 按时间戳降序排序，取第一个
+        items.sort(key=lambda x: x[1], reverse=True)
+        latest_snapshots.append(items[0][0])
+
+    return non_snapshot + latest_snapshots
+
+
 def download_file(url, local_path, auth, retries=3):
     """
     下载单个文件
@@ -182,7 +271,14 @@ def main():
         print("\n未找到任何文件")
         return
 
-    print(f"\n共找到 {len(all_assets)} 个文件，开始下载...\n")
+    # 过滤 snapshot 版本，只保留最新的
+    original_count = len(all_assets)
+    all_assets = filter_latest_snapshots(all_assets)
+    filtered_count = original_count - len(all_assets)
+    if filtered_count > 0:
+        print(f"\n已过滤 {filtered_count} 个旧版本 snapshot 文件")
+
+    print(f"\n共 {len(all_assets)} 个文件需要下载...\n")
 
     # 下载文件
     success_count = 0
