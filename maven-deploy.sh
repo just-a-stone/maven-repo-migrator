@@ -92,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         -j|--jobs)
+            if ! [[ "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo -e "${RED}错误: 并发数必须是正整数${NC}"
+                exit 1
+            fi
             PARALLEL_JOBS="$2"
             shift 2
             ;;
@@ -168,11 +172,13 @@ echo ""
 
 # 创建临时目录存储并发结果
 RESULT_DIR=$(mktemp -d)
-trap "rm -rf $RESULT_DIR" EXIT
+trap 'rm -rf "$RESULT_DIR"' EXIT
 
 # 文件收集数组
-declare -A snapshot_files  # 关联数组：key=groupId:artifactId:version:extension, value=文件路径列表（换行分隔）
-declare -a release_files   # 普通数组：存储 release 文件路径
+# snapshot_files: key=groupId:artifactId:version, value=文件路径列表（换行分隔，包含jar/pom等）
+declare -A snapshot_files
+# release_files: key=groupId:artifactId:version, value=文件路径列表（换行分隔）
+declare -A release_files
 
 # 统计变量
 TOTAL_COUNT=0
@@ -240,6 +246,7 @@ deploy_file() {
     local group_id="$3"
     local artifact_id="$4"
     local version="$5"
+    local paired_pom="$6"  # 配对的pom文件（可能为空）
 
     # 根据版本类型选择仓库
     local target_url
@@ -265,10 +272,12 @@ deploy_file() {
     maven_cmd="$maven_cmd -Durl=$target_url"
     maven_cmd="$maven_cmd -DrepositoryId=$target_id"
 
-    # 如果存在pom文件，添加pom参数
-    local pom_file="${file_path%.*}.pom"
-    if [[ -f "$pom_file" ]] && [[ "$file_type" != "pom" ]]; then
-        maven_cmd="$maven_cmd -DpomFile=$pom_file"
+    # 使用配对的pom文件
+    if [[ -n "$paired_pom" ]] && [[ -f "$paired_pom" ]] && [[ "$file_type" != "pom" ]]; then
+        maven_cmd="$maven_cmd -DpomFile=$paired_pom"
+    elif [[ "$file_type" == "pom" ]]; then
+        # 上传pom文件时，使用pom文件本身作为pomFile
+        maven_cmd="$maven_cmd -DpomFile=$file_path"
     fi
 
     # 添加settings参数
@@ -341,6 +350,64 @@ select_latest_snapshot() {
     echo "$latest_file"
 }
 
+# 从文件组中选择主构件及其配对的pom
+# 返回格式：主构件路径|pom路径（pom可能为空）
+select_artifact_with_pom() {
+    local files="$1"  # 换行分隔的文件列表
+    local is_snapshot="$2"  # 是否为snapshot版本
+
+    # 分离主构件（jar/war/ear）和pom文件
+    local main_artifacts=""
+    local pom_files=""
+
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        local ext="${file##*.}"
+        if [[ "$ext" == "pom" ]]; then
+            if [[ -z "$pom_files" ]]; then
+                pom_files="$file"
+            else
+                pom_files+=$'\n'"$file"
+            fi
+        else
+            if [[ -z "$main_artifacts" ]]; then
+                main_artifacts="$file"
+            else
+                main_artifacts+=$'\n'"$file"
+            fi
+        fi
+    done <<< "$files"
+
+    # 如果没有主构件，只有pom，则返回pom作为主构件
+    if [[ -z "$main_artifacts" ]]; then
+        if [[ "$is_snapshot" == "true" ]]; then
+            local selected_pom=$(select_latest_snapshot "$pom_files")
+        else
+            local selected_pom=$(echo "$pom_files" | head -1)
+        fi
+        echo "$selected_pom|"
+        return
+    fi
+
+    # 选择最新的主构件
+    local selected_main
+    if [[ "$is_snapshot" == "true" ]]; then
+        selected_main=$(select_latest_snapshot "$main_artifacts")
+    else
+        selected_main=$(echo "$main_artifacts" | head -1)
+    fi
+
+    # 查找配对的pom（同名但扩展名为.pom）
+    local main_base="${selected_main%.*}"
+    local paired_pom="${main_base}.pom"
+
+    if echo "$pom_files" | grep -qxF "$paired_pom"; then
+        echo "$selected_main|$paired_pom"
+    else
+        echo "$selected_main|"
+    fi
+}
+
 # 收集构件文件（分类为SNAPSHOT和RELEASE）
 collect_artifact() {
     local file="$1"
@@ -361,30 +428,34 @@ collect_artifact() {
     # 解析Maven信息
     local maven_info=$(parse_maven_info "$file" "$REPO_DIR")
     IFS='|' read -r group_id artifact_id version <<< "$maven_info"
-    local extension="${filename##*.}"
 
-    # 分组键：groupId:artifactId:version:extension
-    local group_key="$group_id:$artifact_id:$version:$extension"
+    # 分组键：groupId:artifactId:version（不含extension，让jar和pom配对）
+    local group_key="$group_id:$artifact_id:$version"
 
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
 
     # 按版本类型分类
     if is_snapshot_version "$version"; then
-        # SNAPSHOT版本：添加到分组（用换行分隔多个文件）
+        # SNAPSHOT版本：添加到分组
         if [[ -z "${snapshot_files[$group_key]}" ]]; then
             snapshot_files["$group_key"]="$file"
         else
             snapshot_files["$group_key"]+=$'\n'"$file"
         fi
     else
-        # RELEASE版本：直接添加到列表
-        release_files+=("$file")
+        # RELEASE版本：也按分组存储
+        if [[ -z "${release_files[$group_key]}" ]]; then
+            release_files["$group_key"]="$file"
+        else
+            release_files["$group_key"]+=$'\n'"$file"
+        fi
     fi
 }
 
 # 处理单个构件
 process_artifact() {
     local file="$1"
+    local paired_pom="$2"  # 配对的pom文件路径（可能为空）
 
     # 解析Maven信息
     local maven_info=$(parse_maven_info "$file" "$REPO_DIR")
@@ -404,7 +475,7 @@ process_artifact() {
 
     # 推送文件并记录结果到临时文件
     local result_file="$RESULT_DIR/result_$$_$RANDOM"
-    if deploy_file "$file" "$extension" "$group_id" "$artifact_id" "$version"; then
+    if deploy_file "$file" "$extension" "$group_id" "$artifact_id" "$version" "$paired_pom"; then
         echo "SUCCESS|$version_type" >> "$result_file"
     else
         echo "ERROR|$version_type" >> "$result_file"
@@ -412,15 +483,28 @@ process_artifact() {
 }
 
 # 并发执行函数
+# 参数格式：file1|pom1 file2|pom2 ...
 run_parallel() {
-    local running=0
-    for file in "$@"; do
-        (process_artifact "$file") &
-        running=$((running + 1))
+    local pids=()
+    for item in "$@"; do
+        local file="${item%%|*}"
+        local pom="${item#*|}"
+        [[ "$pom" == "$file" ]] && pom=""  # 没有|分隔符时pom为空
+
+        (process_artifact "$file" "$pom") &
+        pids+=($!)
         # 达到并发上限时等待一个任务完成
-        if [[ $running -ge $PARALLEL_JOBS ]]; then
-            wait -n 2>/dev/null || wait
-            running=$((running - 1))
+        if [[ ${#pids[@]} -ge $PARALLEL_JOBS ]]; then
+            # 等待任意一个任务完成
+            wait -n 2>/dev/null || wait "${pids[0]}"
+            # 清理已完成的进程
+            local new_pids=()
+            for pid in "${pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    new_pids+=("$pid")
+                fi
+            done
+            pids=("${new_pids[@]}")
         fi
     done
     # 等待所有剩余任务完成
@@ -440,8 +524,28 @@ echo -e "${GREEN}文件收集完成，开始处理...${NC}"
 echo ""
 
 # 第二阶段：处理 RELEASE 文件（并发）
-if [[ ${#release_files[@]} -gt 0 ]]; then
-    run_parallel "${release_files[@]}"
+declare -a release_to_process
+for group_key in "${!release_files[@]}"; do
+    files="${release_files[$group_key]}"
+
+    # 选择主构件及配对的pom
+    result=$(select_artifact_with_pom "$files" "false")
+    main_file="${result%%|*}"
+    paired_pom="${result#*|}"
+
+    if [[ -n "$main_file" ]]; then
+        release_to_process+=("$main_file|$paired_pom")
+
+        # 计算跳过的文件数（总文件数 - 1个主构件 - 配对pom是否被使用）
+        file_count=$(echo "$files" | wc -l)
+        skipped=$((file_count - 1))
+        [[ -n "$paired_pom" ]] && skipped=$((skipped - 1))
+        [[ $skipped -gt 0 ]] && SKIP_COUNT=$((SKIP_COUNT + skipped))
+    fi
+done
+
+if [[ ${#release_to_process[@]} -gt 0 ]]; then
+    run_parallel "${release_to_process[@]}"
 fi
 
 # 第三阶段：处理 SNAPSHOT 文件（去重后，并发）
@@ -449,22 +553,25 @@ declare -a snapshot_to_process
 for group_key in "${!snapshot_files[@]}"; do
     files="${snapshot_files[$group_key]}"
 
-    # 如果该组只有一个文件，直接添加
-    if [[ "$files" != *$'\n'* ]]; then
-        snapshot_to_process+=("$files")
-    else
-        # 多个文件：选择最新的
-        latest=$(select_latest_snapshot "$files")
+    # 选择最新的主构件及配对的pom
+    result=$(select_artifact_with_pom "$files" "true")
+    main_file="${result%%|*}"
+    paired_pom="${result#*|}"
+
+    if [[ -n "$main_file" ]]; then
+        snapshot_to_process+=("$main_file|$paired_pom")
+
+        # 计算跳过的文件数
         file_count=$(echo "$files" | wc -l)
+        skipped=$((file_count - 1))
+        [[ -n "$paired_pom" ]] && skipped=$((skipped - 1))
 
-        if [[ "$MODE" == "test" ]]; then
-            echo -e "${YELLOW}[DEDUP]${NC} $group_key: 发现 $file_count 个文件，选择最新: $(basename "$latest")"
+        if [[ $skipped -gt 0 ]]; then
+            if [[ "$MODE" == "test" ]]; then
+                echo -e "${YELLOW}[DEDUP]${NC} $group_key: 发现 $file_count 个文件，选择最新: $(basename "$main_file")"
+            fi
+            SKIP_COUNT=$((SKIP_COUNT + skipped))
         fi
-
-        snapshot_to_process+=("$latest")
-
-        # 更新跳过计数（去重的文件算作跳过）
-        SKIP_COUNT=$((SKIP_COUNT + file_count - 1))
     fi
 done
 
