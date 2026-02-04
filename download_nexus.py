@@ -9,7 +9,6 @@ import argparse
 import os
 import re
 import sys
-from collections import defaultdict
 from urllib.parse import urljoin
 import requests
 from requests.auth import HTTPBasicAuth
@@ -156,27 +155,29 @@ def parse_artifact_info(path):
     return (group_path, artifact_id, base_version, filename, timestamp)
 
 
-def get_artifact_key(path, filename):
+def get_version_key(group_path, artifact_id, base_version):
     """
-    获取 artifact 的唯一标识（不包含时间戳）
-    用于对同一个 artifact 的多个 snapshot 版本进行分组
+    获取 artifact 版本的唯一标识
+    用于对同一个 artifact 版本的所有文件（jar、pom、sources等）进行分组
+
+    Returns:
+        groupPath/artifactId/baseVersion 格式的 key
     """
-    # 移除时间戳部分，保留基础文件名
-    # 例如: mylib-1.0-20230101.123456-1.jar -> mylib-1.0-SNAPSHOT.jar
-    base_filename = re.sub(r'-\d{8}\.\d{6}-\d+', '-SNAPSHOT', filename)
-    return f"{path}:{base_filename}"
+    return f"{group_path}/{artifact_id}/{base_version}"
 
 
 def filter_latest_snapshots(assets):
     """
     过滤 snapshot 版本，只保留最新的
 
-    对于同一个 artifact 的多个 snapshot 版本，只保留时间戳最新的那个
+    对于同一个 artifact 版本的多个 snapshot 构建，只保留构建号最新的那批文件
+    （包括 jar、pom、sources.jar 等）
     """
-    # 按 artifact key 分组
-    grouped = defaultdict(list)
+    # 按 version key 分组，记录每个版本的最新时间戳
+    version_latest_timestamp = {}
     non_snapshot = []
 
+    # 第一遍：找出每个版本的最新时间戳
     for asset in assets:
         path = asset.get("path", "").strip("/")
         if not path:
@@ -187,20 +188,30 @@ def filter_latest_snapshots(assets):
             info = parse_artifact_info(path)
             if info:
                 group_path, artifact_id, base_version, filename, timestamp = info
-                key = get_artifact_key(f"{group_path}/{artifact_id}/{base_version}", filename)
-                grouped[key].append((asset, timestamp or ""))
+                if timestamp:
+                    key = get_version_key(group_path, artifact_id, base_version)
+                    if key not in version_latest_timestamp or timestamp > version_latest_timestamp[key]:
+                        version_latest_timestamp[key] = timestamp
+
+    # 第二遍：只保留最新时间戳的文件
+    latest_snapshots = []
+    for asset in assets:
+        path = asset.get("path", "").strip("/")
+        if not path:
+            continue
+
+        if "-SNAPSHOT" in path or re.search(r'-\d{8}\.\d{6}-\d+\.', path):
+            info = parse_artifact_info(path)
+            if info:
+                group_path, artifact_id, base_version, filename, timestamp = info
+                key = get_version_key(group_path, artifact_id, base_version)
+                # 保留最新时间戳的文件，或没有时间戳的文件（如 maven-metadata.xml）
+                if not timestamp or timestamp == version_latest_timestamp.get(key):
+                    latest_snapshots.append(asset)
             else:
-                # 无法解析的当作普通文件处理
                 non_snapshot.append(asset)
         else:
             non_snapshot.append(asset)
-
-    # 对每个分组，选择时间戳最大的（最新的）
-    latest_snapshots = []
-    for key, items in grouped.items():
-        # 按时间戳降序排序，取第一个
-        items.sort(key=lambda x: x[1], reverse=True)
-        latest_snapshots.append(items[0][0])
 
     return non_snapshot + latest_snapshots
 
